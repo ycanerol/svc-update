@@ -1,0 +1,865 @@
+#!/usr/bin/python3 -I
+"""svc-update: approve-then-automate container updates (Docker or Podman Compose).
+
+Images stay pinned by tag AND digest in each compose file; svc-update finds updates, asks once, and does the
+legwork after you approve:
+
+  svc-update check [--reoffer]      daily (timer): find eligible updates, send ONE message with an
+                                    [Update] / [Skip] button per service (or the command to run)
+  svc-update status                 running vs available for every service
+  svc-update apply SVC [-y]         pre hook -> pull exact digest -> repin compose -> up -d -> wait healthy
+                                    (+ version check) -> post hook; automatic rollback on failure
+  svc-update apply SVC --force [--version X]
+                                    the same, but also offers releases still inside min_age_days
+                                    (CLI only; pre-releases and anything not newer stay refused)
+  svc-update process-requests       run the button presses / commands tg-gate queued (plugin unit)
+  svc-update test-telegram          send a test message
+  svc-update self-update [-y]       fast-forward this clone to origin, re-run install.sh (root)
+
+Guardrails: stable releases only, at least min_age_days old (unless --force at the CLI), the offer is
+anchored to the registry digest at check time and apply pulls exactly image@digest, no downgrades, one
+update at a time, single-use approvals for exactly the offered version, SIGTERM deferred until an update
+has finished or rolled back.
+
+Paths: root uses /etc/svc-update (services/*.toml, svc-update.toml) and /var/lib/svc-update; any other user
+~/.config/svc-update and ~/.local/state/svc-update. Telegram goes through tg-gate (tg-notify); without it
+svc-update only logs.
+"""
+import argparse, fcntl, glob, json, os, re, secrets, shlex, shutil, signal, subprocess, sys, time, tomllib
+import urllib.error, urllib.request
+
+HOME = os.path.expanduser("~")
+ROOT = os.geteuid() == 0
+CONF = "/etc/svc-update" if ROOT else os.path.join(HOME, ".config/svc-update")
+STATE_DIR = "/var/lib/svc-update" if ROOT else os.path.join(HOME, ".local/state/svc-update")
+SERVICES = os.path.join(CONF, "services")
+SETTINGS = os.path.join(CONF, "svc-update.toml")
+STATE = os.path.join(STATE_DIR, "state.json")
+LOG = os.path.join(STATE_DIR, "svc-update.log")
+RUNS = os.path.join(STATE_DIR, "runs")
+HOSTNAME = os.uname().nodename
+UA = "svc-update/2 (+https://github.com/ycanerol/svc-update)"
+APPROVAL_TTL = 7 * 86400
+REQUEST_MAX_AGE = 3600
+# tg-gate integration (plugin "svc-update")
+TG_NOTIFY = "/usr/local/bin/tg-notify"
+PLUGIN = "svc-update"
+PLUGIN_FILE = "/etc/tg-gate/plugins.d/svc-update.toml"
+INBOX = os.environ.get("TG_GATE_INBOX", "/var/spool/tg-gate/in/svc-update")
+INSTALL_ENV = "/etc/svc-update/install.env"
+
+
+# ---------------------------------------------------------------- utilities
+
+def log(msg, run_log=None):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    line = "%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    if run_log:
+        with open(run_log, "a") as f:
+            f.write(line + "\n")
+    print(line, flush=True)  # terminal for CLI use, journal for units
+
+
+def http_json(url, headers=None, timeout=20):
+    h = {"User-Agent": UA}
+    h.update(headers or {})
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
+        return json.load(r)
+
+
+def registry_digest(image, tag):
+    """Index (multi-arch) digest of image:tag straight from the registry, without pulling.
+    Same value `pull` records in RepoDigests. Supports ghcr.io (and lscr.io, which serves from it) and Docker Hub."""
+    first = image.split("/")[0]
+    if "/" in image and ("." in first or ":" in first):
+        reg, repo = image.split("/", 1)
+    else:
+        reg, repo = "docker.io", image if "/" in image else "library/" + image
+    if reg == "lscr.io":
+        reg = "ghcr.io"
+    if reg == "ghcr.io":
+        tok = http_json("https://ghcr.io/token?scope=repository:%s:pull" % repo)["token"]
+        api = "https://ghcr.io"
+    elif reg == "docker.io":
+        tok = http_json("https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull" % repo)["token"]
+        api = "https://registry-1.docker.io"
+    else:
+        raise RuntimeError("registry %s not supported" % reg)
+    req = urllib.request.Request("%s/v2/%s/manifests/%s" % (api, repo, tag), method="HEAD", headers={
+        "User-Agent": UA, "Authorization": "Bearer " + tok,
+        "Accept": ", ".join(["application/vnd.oci.image.index.v1+json",
+                             "application/vnd.docker.distribution.manifest.list.v2+json",
+                             "application/vnd.oci.image.manifest.v1+json",
+                             "application/vnd.docker.distribution.manifest.v2+json"])})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        d = r.headers.get("Docker-Content-Digest")
+    if not d or not re.fullmatch(r"sha256:[0-9a-f]{64}", d):
+        raise RuntimeError("no digest for %s:%s" % (image, tag))
+    return d
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v.split("-")[0])[:4])
+
+
+def parse_time(s):
+    from datetime import datetime
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def fmt_time(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+
+
+def fmt_age(seconds):
+    return "%.0f h" % (seconds / 3600) if seconds < 3 * 86400 else "%.0f days" % (seconds / 86400)
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+class Lock:
+    """Serialises state changes ("state") and keeps two updates apart ("apply")."""
+    def __init__(self, name="state", block=True, state_dir=None):
+        d = state_dir or STATE_DIR
+        os.makedirs(d, exist_ok=True)
+        self.f = open(os.path.join(d, name + ".lock"), "w")
+        self.block = block
+
+    def __enter__(self):
+        fcntl.flock(self.f, fcntl.LOCK_EX | (0 if self.block else fcntl.LOCK_NB))
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def settings():
+    try:
+        with open(SETTINGS, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def engine():
+    """docker or podman: `engine` in svc-update.toml, else whichever is installed (docker first)."""
+    e = settings().get("engine")
+    if e:
+        if e not in ("docker", "podman"):
+            sys.exit("svc-update.toml: engine must be docker or podman")
+        return e
+    for e in ("docker", "podman"):
+        if shutil.which(e):
+            return e
+    sys.exit("neither docker nor podman found")
+
+
+# ---------------------------------------------------------------- telegram (through tg-gate)
+
+def buttons_enabled():
+    return os.path.exists(PLUGIN_FILE)
+
+
+def send(text, buttons=None, level="info"):
+    """Queue a message with tg-notify. Without tg-gate on this host, messages are only logged."""
+    if not os.access(TG_NOTIFY, os.X_OK):
+        return False
+    cmd = [TG_NOTIFY, "--tool", "svc-update", "--level", level]
+    if buttons:
+        cmd += ["--plugin", PLUGIN, "--buttons", json.dumps(buttons)]
+    r = subprocess.run(cmd + ["-"], input=text, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        log("tg-notify failed: %s" % (r.stderr.strip()[-300:] or r.returncode))
+    return r.returncode == 0
+
+
+def apply_cmd(name):
+    return "%ssvc-update apply %s" % ("sudo " if ROOT else "", name)
+
+
+# ---------------------------------------------------------------- services
+
+class Service:
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            c = tomllib.load(f)
+        self.name = c["name"]
+        self.compose_dir = os.path.expanduser(c["compose_dir"])
+        self.compose_file = os.path.join(self.compose_dir, c.get("compose_file", "compose.yml"))
+        self.compose_service = c["compose_service"]
+        self.image = c["image"]
+        self.tag_format = c.get("tag_format", "{version}")
+        self.src = c["source"]
+        if self.src.get("type") not in ("github", "registry-digest"):
+            raise ValueError("source.type must be github or registry-digest")
+        self.min_age = float(self.src.get("min_age_days", 3)) * 86400
+        self.health = c.get("health", {})
+        self.hooks = c.get("hooks", {})
+        self.avoid = c.get("avoid_minutes")  # [start, end) minutes past the hour
+        self._rels = None
+
+    # --- compose file image line
+    def _image_re(self):
+        return re.compile(r"^(?P<indent>\s*image:\s*)(?P<repo>%s)(?::(?P<tag>[^@\s]+))?(?:@(?P<digest>sha256:[0-9a-f]{64}))?\s*$"
+                          % re.escape(self.image), re.M)
+
+    def pinned(self):
+        with open(self.compose_file) as f:
+            ms = list(self._image_re().finditer(f.read()))
+        if len(ms) != 1:
+            raise RuntimeError("%s: expected exactly one 'image: %s' line in %s, found %d"
+                               % (self.name, self.image, self.compose_file, len(ms)))
+        return ms[0].group("tag"), ms[0].group("digest")
+
+    def version_from_tag(self, tag):
+        pre, _, post = self.tag_format.partition("{version}")
+        if tag and tag.startswith(pre) and tag.endswith(post):
+            return tag[len(pre):len(tag) - len(post) if post else None]
+        return tag
+
+    def tag_for(self, version):
+        return self.tag_format.format(version=version)
+
+    def rewrite_compose(self, tag, digest):
+        with open(self.compose_file) as f:
+            s = f.read()
+        new, n = self._image_re().subn(lambda m: "%s%s:%s@%s" % (m.group("indent"), self.image, tag, digest), s)
+        if n != 1:
+            raise RuntimeError("compose rewrite matched %d lines" % n)
+        with open(self.compose_file, "w") as f:
+            f.write(new)
+
+    def running(self):
+        """What runs now, as shown to the user: version (github) or tag@short-digest (registry-digest)."""
+        tag, digest = self.pinned()
+        if self.src["type"] == "github":
+            return (self.version_from_tag(tag) or "0").lstrip("v")
+        return "%s@%s" % (tag, (digest or "?")[7:19])
+
+    # --- upstream
+    def releases(self):
+        """Stable GitHub releases, newest first (one API call per run)."""
+        if self._rels is None:
+            rels = http_json("https://api.github.com/repos/%s/releases?per_page=30" % self.src["repo"],
+                             {"Accept": "application/vnd.github+json"})
+            self._rels = sorted(({"version": r["tag_name"].lstrip("v"), "published": parse_time(r["published_at"]),
+                                  "url": r.get("html_url", ""), "body": r.get("body") or ""}
+                                 for r in rels if not r.get("draft") and not r.get("prerelease") and r.get("published_at")),
+                                key=lambda r: vtuple(r["version"]), reverse=True)
+        return self._rels
+
+    def updates(self, st=None):
+        """Every update newer than what runs, newest first, including ones still inside min_age:
+        dicts with version, tag, published, eligible (time), url [, digest, body].
+        st: the state dict; check passes it so registry-digest first-seen times are recorded."""
+        now = time.time()
+        tag, digest = self.pinned()
+        if self.src["type"] == "github":
+            running = vtuple(self.running())
+            return [dict(r, tag=self.tag_for(r["version"]), eligible=r["published"] + self.min_age)
+                    for r in self.releases() if vtuple(r["version"]) > running]
+        # registry-digest: a floating tag (e.g. latest, 18, 9-alpine) moved to a new image. Registries have no
+        # trustworthy publish date, so age counts from the first time THIS host saw the new digest.
+        remote = registry_digest(self.image, tag)
+        if st is not None:
+            rec = st.setdefault("first_seen", {}).setdefault(self.name, {})
+            for k in list(rec):
+                if k != remote:
+                    del rec[k]                      # forget digests the tag no longer points at
+            if remote != digest:
+                rec.setdefault(remote, now)
+        if remote == digest:
+            return []
+        seen = (st if st is not None else load_state()).get("first_seen", {}).get(self.name, {}).get(remote, now)
+        return [{"version": "%s@%s" % (tag, remote[7:19]), "tag": tag, "digest": remote, "published": seen,
+                 "eligible": seen + self.min_age, "url": self.src.get("url", "")}]
+
+    def offer(self, u, ups):
+        """Turn one entry of updates() into an offer: flags from every release it skips, anchored digest."""
+        between = [x for x in ups if vtuple(x["version"]) <= vtuple(u["version"])] if self.src["type"] == "github" else [u]
+        notes = "\n".join(x.get("body", "") for x in between)
+        return {"version": u["version"], "tag": u["tag"], "running": self.running(), "url": u["url"],
+                "published": u["published"], "eligible": u["eligible"], "n_releases": len(between),
+                "security": bool(re.search(r"security|CVE-|vulnerab|GHSA-", notes, re.I)),
+                "breaking": bool(re.search(r"breaking|migration", notes, re.I)),
+                "advisories": self.advisories(),
+                # anchor the offer to the digest the tag points at NOW; apply pulls exactly this digest,
+                # so a tag re-pushed after the offer is refused
+                "expect_digest": u.get("digest") or registry_digest(self.image, u["tag"])}
+
+    def candidate(self, st=None):
+        """(offer for the newest eligible update or None, newest update still inside min_age or None)."""
+        ups = self.updates(st)
+        now = time.time()
+        ok = [u for u in ups if u["eligible"] <= now]
+        young = ups[0] if ups and ups[0]["eligible"] > now else None
+        return (self.offer(ok[0], ups) if ok else None), young
+
+    def advisories(self):
+        if self.src["type"] != "github":
+            return []
+        try:
+            advs = http_json("https://api.github.com/repos/%s/security-advisories?state=published&per_page=30"
+                             % self.src["repo"], {"Accept": "application/vnd.github+json"})
+            return [a.get("ghsa_id") for a in advs if a.get("ghsa_id")]
+        except Exception:
+            return []
+
+    # --- runtime
+    def compose(self, *args, run_log=None, check=True, timeout=900):
+        return run([engine(), "compose", "-f", self.compose_file] + list(args), cwd=self.compose_dir,
+                   run_log=run_log, check=check, timeout=timeout)
+
+    def container_state(self):
+        """(status, health, restarts) of the service's container; health is "none" without a healthcheck."""
+        r = self.compose("ps", "-q", self.compose_service, check=False)
+        ids = r.stdout.split()
+        if not ids:
+            return None
+        r = run([engine(), "inspect", ids[0]], check=False)
+        try:
+            c = json.loads(r.stdout)[0]
+        except Exception:
+            return "?", "?", 0
+        state = c.get("State", {})
+        health = (state.get("Health") or state.get("Healthcheck") or {}).get("Status") or "none"
+        return state.get("Status", "?"), health, int(c.get("RestartCount") or 0)
+
+    def wait_healthy(self, expect_version, run_log):
+        timeout = int(self.health.get("timeout_s", 300))
+        deadline = time.time() + timeout
+        last = "no container"
+        while time.time() < deadline:
+            cs = self.container_state()
+            if cs:
+                status, health, restarts = cs
+                last = "status=%s health=%s restarts=%d" % cs
+                if status == "running" and health in ("healthy", "none"):
+                    if health == "none":
+                        time.sleep(int(self.health.get("settle_s", 20)))
+                    ok, info = self.check_url(expect_version)
+                    if ok:
+                        return True, "%s; %s" % (last, info)
+                    last += "; " + info
+                if restarts >= 3:
+                    return False, "crash loop: " + last
+            time.sleep(5)
+        return False, "timeout after %ds: %s" % (timeout, last)
+
+    def check_url(self, expect_version):
+        """health.url must answer 2xx. Only with version_key (and a version to expect) is the body JSON."""
+        url = self.health.get("url")
+        if not url:
+            return True, "no url check"
+        h = {"User-Agent": UA}
+        if self.health.get("host"):
+            h["Host"] = self.health["host"]
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=10) as r:
+                code, body = r.status, r.read(65536)
+        except urllib.error.HTTPError as e:
+            e.close()
+            return False, "url check HTTP %d" % e.code
+        except Exception as e:
+            return False, "url check %s" % type(e).__name__
+        key = self.health.get("version_key")
+        if not (key and expect_version):
+            return True, "url ok (HTTP %d)" % code
+        try:
+            got = str(json.loads(body).get(key, "")).lstrip("v")
+        except Exception as e:
+            return False, "url check: no JSON %s (%s)" % (key, type(e).__name__)
+        if got != expect_version:
+            return False, "version is %s, expected %s" % (got, expect_version)
+        return True, "reports version %s" % got
+
+    def hook(self, which, run_log):
+        cmd = self.hooks.get(which)
+        if not cmd:
+            return
+        log("%s: running %s hook" % (self.name, which), run_log)
+        run(["bash", "-o", "pipefail", "-ec", cmd], cwd=self.compose_dir, run_log=run_log,
+            timeout=int(self.hooks.get("timeout_s", 1800)))
+
+
+def run(cmd, cwd=None, run_log=None, check=True, timeout=900):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                       env=dict(os.environ, HOME=HOME))
+    if run_log:
+        with open(run_log, "a") as f:
+            f.write("$ %s\n%s%s" % (" ".join(shlex.quote(c) for c in cmd), r.stdout[-4000:], r.stderr[-4000:]))
+    if check and r.returncode != 0:
+        raise RuntimeError("%s failed (exit %d): %s" % (cmd[0] if cmd[0] != "bash" else "hook",
+                                                        r.returncode, (r.stderr or r.stdout).strip()[-400:]))
+    return r
+
+
+def services():
+    out = {}
+    for p in sorted(glob.glob(os.path.join(SERVICES, "*.toml"))):
+        try:
+            s = Service(p)
+            out[s.name] = s
+        except Exception as e:
+            log("config %s invalid: %s" % (os.path.basename(p), e))
+    return out
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_check(args):
+    report_killed_update()
+    svcs = services()
+    lines, buttons = [], []
+    with Lock():
+        st = load_state()
+        st.setdefault("notified", {})
+        st.setdefault("pending", {})
+        now = time.time()
+        st["pending"] = {k: v for k, v in st["pending"].items() if now - v["created"] < APPROVAL_TTL}
+        for name, s in svcs.items():
+            try:
+                cand, young = s.candidate(st)
+            except Exception as e:
+                log("%s: check failed: %s: %s" % (name, type(e).__name__, str(e)[:200]))
+                continue
+            known = st.setdefault("advisories", {})
+            first_check = name not in known
+            advs = cand["advisories"] if cand else s.advisories()
+            # the first check of a service only records existing advisories (no false SECURITY flag)
+            new_adv = [] if first_check else [a for a in advs if a not in known[name]]
+            known[name] = sorted(set(known.get(name, [])) | set(advs))
+            if not cand:
+                if new_adv:
+                    if young:
+                        lines.append("• %s: new security advisory %s; release %s (%s) is out but younger than "
+                                     "%g days: offered in the first check after %s\n  %s"
+                                     % (name, ", ".join(new_adv), young["version"], fmt_time(young["published"]),
+                                        s.min_age / 86400, fmt_time(young["eligible"]), young["url"]))
+                    else:
+                        lines.append("• %s: new security advisory %s (no newer release published yet)"
+                                     % (name, ", ".join(new_adv)))
+                log("%s: up to date" % name + (" (%s inside the age gate)" % young["version"] if young else ""))
+                continue
+            key = cand["version"] + ("+sec" if cand["security"] else "")
+            if st["notified"].get(name) == key and not new_adv and not args.reoffer:
+                log("%s: %s already offered" % (name, cand["version"]))
+                continue
+            # a new offer withdraws older buttons for the same service (no stale-button downgrades)
+            st["pending"] = {k: v for k, v in st["pending"].items() if v["svc"] != name}
+            tok = secrets.token_hex(6)
+            st["pending"][tok] = {"svc": name, "version": cand["version"], "tag": cand["tag"],
+                                  "expect_digest": cand["expect_digest"], "created": now}
+            st["notified"][name] = key
+            flags = []
+            if cand["security"] or new_adv:
+                flags.append("SECURITY")
+            if cand["breaking"]:
+                flags.append("notes mention breaking/migration")
+            if cand["n_releases"] > 1:
+                flags.append("%d releases" % cand["n_releases"])
+            if young:
+                flags.append("newer %s offered after %s" % (young["version"], fmt_time(young["eligible"])))
+            lines.append("• %s: %s → %s%s\n  %s" % (name, cand["running"], cand["version"],
+                                                   " [%s]" % ", ".join(flags) if flags else "", cand["url"]))
+            if buttons_enabled():
+                buttons.append([{"text": "Update %s → %s" % (name, cand["version"][:20]), "verb": "u", "token": tok},
+                                {"text": "Skip", "verb": "s", "token": tok}])
+            else:
+                lines.append("  approve on %s: %s" % (HOSTNAME, apply_cmd(name)))
+            log("%s: offering %s (token %s)" % (name, cand["version"], tok))
+        save_state(st)
+    if lines:
+        how = ("Read the release notes, then tap Update. Each update runs the pre hook first and rolls back "
+               "automatically if the service does not come back healthy. Buttons expire in 7 days.") if buttons else (
+               "Run the shown command on %s. Each update runs the pre hook first and rolls back automatically "
+               "if the service does not come back healthy." % HOSTNAME)
+        min_days = min(s.min_age for s in svcs.values()) / 86400
+        send("Updates available on %s (releases/images ≥ %g days old):\n\n%s\n\n%s"
+             % (HOSTNAME, min_days, "\n".join(lines), how), buttons or None)
+    elif args.reply:
+        send("No updates available on %s (%d services checked)." % (HOSTNAME, len(svcs)))
+
+
+def cmd_status(args):
+    for name, s in services().items():
+        try:
+            tag, digest = s.pinned()
+            cand, young = s.candidate()
+            info = "-> %s" % cand["version"] if cand else "up to date"
+            if young and (not cand or young["version"] != cand["version"]):
+                info += " (%s from %s)" % (young["version"], fmt_time(young["eligible"]))
+            print("%-18s %-30s %s" % (name, "%s@%s" % (tag, (digest or "")[7:19]), info))
+        except Exception as e:
+            print("%-18s ERROR %s" % (name, e))
+
+
+def choose_forced(s, args):
+    """--force: the update to apply, chosen by --version or from a numbered list (Enter = cancel)."""
+    ups = s.updates(load_state())
+    if not ups:
+        print("%s is up to date (%s)" % (s.name, s.running()))
+        return None, ups
+    now = time.time()
+    if args.version:
+        want = args.version.lstrip("v")
+        match = [u for u in ups if u["version"] == want or u["version"].split("@")[-1].startswith(want)]
+        if not match:
+            sys.exit("%s: %s is not a newer stable release. Newer: %s"
+                     % (s.name, args.version, ", ".join(u["version"] for u in ups[:10])))
+        return match[0], ups
+    print("%s runs %s. Newer stable releases:" % (s.name, s.running()))
+    shown = ups[:10]
+    for i, u in enumerate(shown, 1):
+        gate = ("eligible" if u["eligible"] <= now else "inside the age gate until %s" % fmt_time(u["eligible"]))
+        print("  %d) %-24s published %s (%s ago), %s" % (i, u["version"], fmt_time(u["published"]),
+                                                          fmt_age(now - u["published"]), gate))
+    try:
+        pick = input("Choose [1-%d, Enter = cancel]: " % len(shown)).strip()
+    except EOFError:
+        pick = ""
+    if not pick.isdigit() or not 1 <= int(pick) <= len(shown):
+        print("aborted")
+        return None, ups
+    return shown[int(pick) - 1], ups
+
+
+def cmd_apply(args, approved=None):
+    """approved: a pending offer from a button press (process-requests); otherwise interactive CLI."""
+    svcs = services()
+    if args.service not in svcs:
+        sys.exit("unknown service %s (have: %s)" % (args.service, ", ".join(svcs)))
+    s = svcs[args.service]
+    forced = False
+    if approved:
+        version, tag, expect_digest = approved["version"], approved["tag"], approved["expect_digest"]
+    else:
+        if args.force:
+            u, ups = choose_forced(s, args)
+            if not u:
+                return 1 if ups else 0
+            cand = s.offer(u, ups)
+            forced = cand["eligible"] > time.time()
+        else:
+            if args.version:
+                sys.exit("--version needs --force")
+            cand, young = s.candidate()
+            if not cand:
+                print("%s is up to date%s" % (s.name, " (%s is inside the age gate until %s; --force to apply it now)"
+                                              % (young["version"], fmt_time(young["eligible"])) if young else ""))
+                return 0
+        version, tag, expect_digest = cand["version"], cand["tag"], cand["expect_digest"]
+        print("%s: %s -> %s  %s" % (s.name, cand["running"], version, cand["url"]))
+        if forced:
+            print("  AGE GATE BYPASSED: published %s ago, minimum is %g days"
+                  % (fmt_age(time.time() - cand["published"]), s.min_age / 86400))
+        if cand["security"]:
+            print("  release notes mention SECURITY fixes")
+        if cand["breaking"]:
+            print("  release notes mention breaking changes / migrations: read them first")
+        # the numbered menu is the confirmation; --version and plain apply ask y/N unless -y
+        if not (args.force and not args.version) and not args.yes:
+            if input("Update %s to %s? [y/N] " % (s.name, version)).strip().lower() != "y":
+                print("aborted")
+                return 1
+    if forced:
+        msg = "%s: age gate bypassed with --force for %s (published %s ago, minimum %g days)" % (
+            s.name, version, fmt_age(time.time() - cand["published"]), s.min_age / 86400)
+        log(msg)
+        send(msg, level="warn")
+    try:
+        with Lock("apply", block=False):
+            return do_apply(s, version, tag, expect_digest)
+    except BlockingIOError:
+        msg = "%s: another update is running, try again later" % s.name
+        log(msg)
+        send(msg)
+        return 1
+
+
+def set_in_progress(value):
+    with Lock():
+        st = load_state()
+        if value is None:
+            st.pop("in_progress", None)
+        else:
+            st["in_progress"] = value
+        save_state(st)
+
+
+def do_apply(s, version, tag, expect_digest):
+    """Run one update. SIGTERM (stop, reboot) is deferred until the update has finished or rolled back,
+    and an in_progress marker lets the next run report an update that was killed anyway."""
+    term = {"got": False}
+    prev = signal.signal(signal.SIGTERM, lambda *a: term.__setitem__("got", True))
+    set_in_progress({"svc": s.name, "to": tag, "started": time.time(), "pid": os.getpid()})
+    try:
+        rc = _do_apply(s, version, tag, expect_digest)
+    finally:
+        set_in_progress(None)
+        signal.signal(signal.SIGTERM, prev)
+    if term["got"]:
+        log("%s: SIGTERM arrived during the update; exiting now that it has finished" % s.name)
+        sys.exit(0)
+    return rc
+
+
+def _do_apply(s, version, tag, expect_digest):
+    os.makedirs(RUNS, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    run_log = os.path.join(RUNS, "%s-%s.log" % (stamp, s.name))
+    if s.avoid:
+        a, b = s.avoid
+        m = time.localtime().tm_min
+        if a <= m < b:
+            wait = (b - m) * 60
+            log("%s: inside avoid window :%02d-:%02d, waiting %ds" % (s.name, a, b, wait), run_log)
+            time.sleep(wait)
+    old_tag, old_digest = s.pinned()
+    # never move backwards: a stale button or CLI call for an older/equal version is refused
+    if s.src["type"] == "github":
+        if vtuple(version) <= vtuple(s.running()):
+            msg = "%s: refusing %s, running %s is the same or newer (no downgrades)" % (s.name, version, s.running())
+            log(msg, run_log)
+            send("⛔ " + msg)
+            return 1
+    elif tag != old_tag:
+        msg = "%s: refusing tag change %s -> %s for a digest-tracked service" % (s.name, old_tag, tag)
+        log(msg, run_log)
+        send("⛔ " + msg)
+        return 1
+    if not expect_digest:
+        raise RuntimeError("no anchored digest for %s %s" % (s.name, version))
+    eng = engine()
+    bak = "%s.bak-svc-update-%s" % (s.compose_file, stamp)
+    log("%s: update %s@%s -> %s (%s, log %s)" % (s.name, old_tag, (old_digest or "")[7:19], tag, eng, run_log), run_log)
+    send("⏳ %s: updating %s → %s" % (s.name, old_tag, tag))
+    # 1) everything that can fail without touching the running service
+    try:
+        s.hook("pre", run_log)
+        ref = "%s@%s" % (s.image, expect_digest)        # exactly the digest that was offered
+        run([eng, "pull", ref], run_log=run_log, timeout=1800)
+        digests = run([eng, "image", "inspect", "-f", "{{json .RepoDigests}}", ref]).stdout
+        short = s.image.split("docker.io/library/")[-1].split("docker.io/")[-1]
+        names = (s.image, short, "docker.io/" + short, "docker.io/library/" + short)
+        found = [d.split("@")[1] for d in (json.loads(digests) or []) if d.split("@")[0] in names]
+        if expect_digest not in found:
+            raise RuntimeError("pulled image does not carry the offered digest %s (has %s)" % (expect_digest, found))
+        if (tag, expect_digest) == (old_tag, old_digest):
+            log("%s: already on %s@%s" % (s.name, tag, expect_digest[7:19]), run_log)
+            send("✅ %s already on %s" % (s.name, tag))
+            return 0
+        with open(s.compose_file) as f, open(bak, "w") as g:
+            g.write(f.read())
+        s.rewrite_compose(tag, expect_digest)
+        s.compose("config", "-q", run_log=run_log)
+    except Exception as e:
+        if os.path.exists(bak):
+            os.replace(bak, s.compose_file)
+        log("%s: aborted before touching the service: %s" % (s.name, e), run_log)
+        send("❌ %s: update to %s aborted, nothing changed.\n%s" % (s.name, tag, str(e)[:600]))
+        return 1
+    # 2) switch
+    try:
+        s.compose("up", "-d", s.compose_service, run_log=run_log, timeout=1800)
+        ok, info = s.wait_healthy(version if s.src["type"] == "github" else None, run_log)
+    except Exception as e:
+        ok, info = False, str(e)
+    if ok:
+        if s.hooks.get("post"):
+            try:
+                s.hook("post", run_log)
+            except Exception as e:
+                info += "; post hook failed: %s" % str(e)[:200]
+        log("%s: updated to %s@%s: %s" % (s.name, tag, expect_digest[7:19], info), run_log)
+        send("✅ %s updated to %s (%s)\n%s\ncompose backup: %s"
+             % (s.name, tag, expect_digest[7:19], info, os.path.basename(bak)))
+        return 0
+    # 3) roll back
+    log("%s: update FAILED (%s), rolling back" % (s.name, info), run_log)
+    try:
+        os.replace(bak, s.compose_file)
+        s.hook("rollback", run_log)
+        s.compose("up", "-d", s.compose_service, run_log=run_log, timeout=1800)
+        rok, rinfo = s.wait_healthy(None, run_log)
+        rb = ("rolled back to %s: %s" if rok else "ROLLBACK UNHEALTHY (%s): %s") % (old_tag, rinfo)
+    except Exception as e:
+        rb = "ROLLBACK ERROR: %s" % e
+    log("%s: %s" % (s.name, rb), run_log)
+    send("❌ %s: update to %s failed: %s\n%s\nlog: %s" % (s.name, tag, info[:500], rb[:500], run_log), level="alert")
+    return 1
+
+
+def report_killed_update():
+    """An update whose process died (kill -9, OOM, power loss) leaves in_progress behind: report it once."""
+    st = load_state()
+    ip = st.get("in_progress")
+    if not ip:
+        return
+    try:
+        os.kill(int(ip.get("pid", 0)), 0)
+        return  # still running
+    except Exception:
+        pass
+    msg = ("an update of %s to %s started %s did not finish (process killed). Check `svc-update status`, "
+           "the containers and the newest log in %s; compose backups are next to the compose file "
+           "(*.bak-svc-update-*)." % (ip.get("svc"), ip.get("to"), fmt_time(ip.get("started", 0)), RUNS))
+    log("process: " + msg)
+    send("⚠️ " + msg, level="warn")
+    set_in_progress(None)
+
+
+def valid_request(req):
+    """Requests come from tg-gate, which only routes: check everything again."""
+    if not isinstance(req, dict) or req.get("v") != 1 or req.get("plugin") != PLUGIN:
+        return False
+    try:
+        age = time.time() - float(req.get("ts", 0))
+    except (TypeError, ValueError):
+        return False
+    if not -60 <= age <= REQUEST_MAX_AGE:
+        return False
+    if req.get("kind") == "callback":
+        return req.get("verb") in ("u", "s") and bool(re.fullmatch(r"[0-9a-f]{12}", str(req.get("token", ""))))
+    if req.get("kind") == "command":
+        return req.get("command") in ("status", "check")
+    return False
+
+
+def cmd_process(args):
+    report_killed_update()
+    for path in sorted(glob.glob(os.path.join(INBOX, "*.json"))):
+        try:
+            with open(path) as f:
+                req = json.load(f)
+        except Exception as e:
+            log("process: unreadable request %s: %s" % (os.path.basename(path), type(e).__name__))
+            req = None
+        try:
+            os.remove(path)          # single use, before acting
+        except FileNotFoundError:
+            continue
+        if not valid_request(req):
+            log("process: rejected request %s: %s" % (os.path.basename(path), json.dumps(req)[:200]))
+            continue
+        try:
+            process_one(req)
+        except Exception as e:
+            log("process: error: %s: %s" % (type(e).__name__, str(e)[:200]))
+
+
+def process_one(req):
+    me = [sys.executable, "-I", os.path.realpath(__file__)]
+    if req["kind"] == "command":
+        if req["command"] == "status":
+            r = subprocess.run(me + ["status"], capture_output=True, text=True, timeout=300)
+            send("%s services:\n%s" % (HOSTNAME, (r.stdout or r.stderr)[-3500:]))
+        else:
+            subprocess.run(me + ["check", "--reoffer", "--reply"], timeout=600)
+        return
+    with Lock():
+        st = load_state()
+        p = st.get("pending", {}).pop(req["token"], None)
+        save_state(st)
+    if not p or time.time() - p["created"] > APPROVAL_TTL:
+        send("⌛ That button expired or was already used.")
+        return
+    if req["verb"] == "s":
+        log("process: skipped %s %s" % (p["svc"], p["version"]))
+        send("Skipped %s %s" % (p["svc"], p["version"]))
+        return
+    log("process: approved %s %s" % (p["svc"], p["version"]))
+    cmd_apply(argparse.Namespace(service=p["svc"], yes=True, force=False, version=None), approved=p)
+
+
+def cmd_self_update(args):
+    if not ROOT:
+        sys.exit("run as root: sudo svc-update self-update")
+    repo = os.path.dirname(os.path.realpath(__file__))
+    st = os.stat(repo)
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        sys.exit("%s must be owned by root and not group/world writable" % repo)
+    git = ["git", "-C", repo]
+    out = lambda *a: subprocess.run(git + list(a), check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["fetch", "--quiet", "origin"], check=True)
+    new, old = out("log", "--oneline", "HEAD..@{u}"), out("rev-parse", "--short", "HEAD")
+    if not new:
+        print("up to date (%s)" % old)
+        return 0
+    print("%d new commit(s):\n%s" % (len(new.splitlines()), new))
+    subprocess.run(git + ["--no-pager", "diff", "--stat", "HEAD", "@{u}"], check=True)
+    if not args.yes and input("Update? [y/N] ").strip().lower() != "y":
+        print("aborted")
+        return 1
+    compile(out("show", "@{u}:svc-update"), "svc-update", "exec")
+    print("  ok   new version compiles")
+    # never switch code under a running update: take the apply lock of the user svc-update runs as
+    run_as = "root"
+    try:
+        with open(INSTALL_ENV) as f:
+            run_as = re.search(r"^RUN_AS=(\S+)", f.read(), re.M).group(1)
+    except Exception:
+        pass
+    state_dir = STATE_DIR if run_as == "root" else os.path.join(os.path.expanduser("~" + run_as), ".local/state/svc-update")
+    try:
+        with Lock("apply", block=False, state_dir=state_dir):
+            subprocess.run(git + ["merge", "--quiet", "--ff-only", "@{u}"], check=True)
+    except BlockingIOError:
+        sys.exit("an update is running; try again when it has finished")
+    newrev = out("rev-parse", "--short", "HEAD")
+    subprocess.run([os.path.join(repo, "install.sh")], check=True)
+    print("  ok   svc-update %s -> %s" % (old, newrev))
+    send("svc-update on %s updated %s -> %s" % (HOSTNAME, old, newrev))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("--reoffer", action="store_true", help="offer again what was already offered")
+    c.add_argument("--reply", action="store_true", help="also say so when nothing is available (/check)")
+    sub.add_parser("status")
+    a = sub.add_parser("apply")
+    a.add_argument("service")
+    a.add_argument("-y", "--yes", action="store_true")
+    a.add_argument("--force", action="store_true", help="also offer releases inside min_age_days (CLI only)")
+    a.add_argument("--version", help="with --force: apply this release without the menu")
+    sub.add_parser("process-requests")
+    sub.add_parser("test-telegram")
+    u = sub.add_parser("self-update")
+    u.add_argument("-y", "--yes", action="store_true")
+    args = ap.parse_args()
+    if args.cmd == "check":
+        cmd_check(args)
+    elif args.cmd == "status":
+        cmd_status(args)
+    elif args.cmd == "apply":
+        sys.exit(cmd_apply(args))
+    elif args.cmd == "process-requests":
+        cmd_process(args)
+    elif args.cmd == "test-telegram":
+        print("queued" if send("svc-update test message from %s, ignore" % HOSTNAME) else "FAILED (is tg-gate installed?)")
+    elif args.cmd == "self-update":
+        sys.exit(cmd_self_update(args))
+
+
+if __name__ == "__main__":
+    main()

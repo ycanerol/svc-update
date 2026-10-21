@@ -1,0 +1,31 @@
+# svc-update service definition: copy to <config>/services/<name>.toml (only *.toml files are read).
+#   root:       /etc/svc-update/services/      other users: ~/.config/svc-update/services/
+# Requirement: the compose file has exactly ONE line `image: <image>:<tag>@sha256:<digest>` for this image.
+# Pin it once by hand; svc-update maintains it afterwards. `svc-update status` validates the file.
+name = "myservice"                 # used in buttons and `svc-update apply myservice`
+compose_dir = "~/docker/myservice"
+compose_service = "myservice"      # service key inside the compose file
+# compose_file = "compose.yml"     # default
+image = "ghcr.io/org/myservice"    # without tag/digest (ghcr.io, lscr.io and Docker Hub are supported)
+tag_format = "v{version}"          # how a release version maps to an image tag
+# avoid_minutes = [15, 35]         # never switch containers between :15 and :35 past the hour
+
+[source]
+type = "github"                    # newest stable GitHub release that is >= min_age_days old
+repo = "org/myservice"
+# type = "registry-digest"         # OR: the pinned tag (latest, 18, 9-alpine...) moved to a new image;
+# url = "https://hub.docker.com/_/postgres"   # offered once this host has seen it for min_age_days
+min_age_days = 3
+
+[health]                           # the container must be running, and healthy if it has a healthcheck
+url = "http://127.0.0.1:8080/api/version"   # optional: must answer HTTP 2xx
+# host = "myservice.example.com"   # optional Host header (e.g. to go through a reverse proxy)
+version_key = "version"            # optional: JSON key in that answer that must equal the new version
+timeout_s = 300
+# settle_s = 20                    # without a healthcheck: wait this long after "running"
+
+[hooks]                            # bash snippets, run in compose_dir; any failure aborts
+pre = "~/bin/backup.sh"            # before anything changes (failure = nothing touched)
+# post = "..."                     # after a healthy update
+# rollback = "..."                 # after the compose file is restored, before the old image starts
+# timeout_s = 1800

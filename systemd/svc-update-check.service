@@ -1,0 +1,13 @@
+# Installed by svc-update's install.sh from @PREFIX@.
+[Unit]
+Description=svc-update: check for container updates and offer them
+After=network-online.target
+Wants=network-online.target
+OnFailure=tg-gate-failed@%n.service
+
+[Service]
+Type=oneshot
+User=@RUN_AS@
+ExecStart=/usr/local/bin/svc-update check
+NoNewPrivileges=yes
+PrivateTmp=yes

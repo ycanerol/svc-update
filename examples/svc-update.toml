@@ -1,0 +1,2 @@
+# Optional host settings: <config>/svc-update.toml (root: /etc/svc-update/svc-update.toml)
+# engine = "podman"                # docker or podman; default: docker if installed, else podman

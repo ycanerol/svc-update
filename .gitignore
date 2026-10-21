@@ -1,0 +1,12 @@
+# local working notes (host-specific, never public)
+HANDOFF.md
+PLAN.md
+
+# secrets
+.env
+*.key
+*token*
+telegram
+*.pem
+
+__pycache__/

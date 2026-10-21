@@ -1,0 +1,10 @@
+# Installed by svc-update's install.sh (time: --check-time).
+[Unit]
+Description=svc-update: daily check at @CHECK_TIME@
+
+[Timer]
+OnCalendar=*-*-* @CHECK_TIME@:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

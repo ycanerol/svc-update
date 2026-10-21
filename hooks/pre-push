@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Refuse to push anything that looks private: IPv4 addresses, e-mail addresses, Telegram bot tokens, and the
+# words listed one per line in .git/info/denylist (host names, domains, ids; that file is never committed).
+# Checks every commit being pushed: messages, authors and full diffs (history is public forever).
+# Enable once per clone:  git config core.hooksPath hooks
+set -euo pipefail
+deny="$(git rev-parse --git-dir)/info/denylist"
+zero=0000000000000000000000000000000000000000
+fail=0
+report() { echo "pre-push: $1:" >&2; sed 's/^/    /' >&2; fail=1; }
+while read -r _ local_sha _ remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  if [ "$remote_sha" = "$zero" ]; then range=$local_sha; else range=$remote_sha..$local_sha; fi
+  text=$(git log --format='commit %H%nauthor %an <%ae>%ncommitter %cn <%ce>%n%B' -p "$range")
+  hits=$(grep -noE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' <<<"$text" | grep -vE ':(127\.0\.0\.1|0\.0\.0\.0)$' || true)
+  [ -z "$hits" ] || report "IPv4 addresses" <<<"$hits"
+  hits=$(grep -noE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' <<<"$text" |
+         grep -vE '@(users\.noreply\.github\.com|example\.(com|org))$' || true)
+  [ -z "$hits" ] || report "e-mail addresses" <<<"$hits"
+  hits=$(grep -noE '[0-9]{8,10}:[A-Za-z0-9_-]{35}' <<<"$text" || true)
+  [ -z "$hits" ] || report "Telegram bot tokens" <<<"$hits"
+  if [ -s "$deny" ]; then
+    hits=$(grep -niwoF -f <(grep -v '^\s*\(#\|$\)' "$deny") <<<"$text" || true)
+    [ -z "$hits" ] || report "words from .git/info/denylist" <<<"$hits"
+  else
+    echo "pre-push: warning: no $deny, private words not checked" >&2
+  fi
+done
+[ "$fail" = 0 ] || { echo "pre-push: refused. Rewrite the commits (git commit --amend / git rebase) and push again." >&2; exit 1; }
