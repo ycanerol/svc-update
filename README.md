@@ -87,4 +87,4 @@ In Telegram: the buttons, `/status` and `/check`.
 | `/var/lib/svc-update/` | `~/.local/state/svc-update/` | `state.json`, `svc-update.log`, one log per update in `runs/` |
 
 Compose backups are written next to each compose file as `*.bak-svc-update-<time>`.
-Tests: `python3 -m unittest discover -s tests`.
+Tests: `python3 -m unittest discover -s tests`; end to end (Docker, with tg-gate cloned next to this repo): `tests/integration/run.sh`.
