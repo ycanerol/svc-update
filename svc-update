@@ -515,6 +515,9 @@ def choose_forced(s, args):
     """--force: the update to apply, chosen by --version or from a numbered list (Enter = cancel)."""
     ups = s.updates(load_state())
     if not ups:
+        if args.version:
+            sys.exit("%s: refusing %s, nothing newer than the running %s exists (no downgrades)"
+                     % (s.name, args.version, s.running()))
         print("%s is up to date (%s)" % (s.name, s.running()))
         return None, ups
     now = time.time()
