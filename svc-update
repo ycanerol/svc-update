@@ -449,12 +449,12 @@ def cmd_check(args):
             if not cand:
                 if new_adv:
                     if young:
-                        lines.append("• %s: new security advisory %s; release %s (%s) is out but younger than "
+                        lines.append("• `%s`: new security advisory %s; release `%s` (%s) is out but younger than "
                                      "%g days: offered in the first check after %s\n  %s"
                                      % (name, ", ".join(new_adv), young["version"], fmt_time(young["published"]),
                                         s.min_age / 86400, fmt_time(young["eligible"]), young["url"]))
                     else:
-                        lines.append("• %s: new security advisory %s (no newer release published yet)"
+                        lines.append("• `%s`: new security advisory %s (no newer release published yet)"
                                      % (name, ", ".join(new_adv)))
                 log("%s: up to date" % name + (" (%s inside the age gate)" % young["version"] if young else ""))
                 continue
@@ -476,14 +476,14 @@ def cmd_check(args):
             if cand["n_releases"] > 1:
                 flags.append("%d releases" % cand["n_releases"])
             if young:
-                flags.append("newer %s offered after %s" % (young["version"], fmt_time(young["eligible"])))
-            lines.append("• %s: %s → %s%s\n  %s" % (name, cand["running"], cand["version"],
+                flags.append("newer `%s` offered after %s" % (young["version"], fmt_time(young["eligible"])))
+            lines.append("• `%s`: `%s` → `%s`%s\n  %s" % (name, cand["running"], cand["version"],
                                                    " [%s]" % ", ".join(flags) if flags else "", cand["url"]))
             if buttons_enabled():
                 buttons.append([{"text": "Update %s → %s" % (name, cand["version"][:20]), "verb": "u", "token": tok},
                                 {"text": "Skip", "verb": "s", "token": tok}])
             else:
-                lines.append("  approve on %s: %s" % (HOSTNAME, apply_cmd(name)))
+                lines.append("  approve on %s: `%s`" % (HOSTNAME, apply_cmd(name)))
             log("%s: offering %s (token %s)" % (name, cand["version"], tok))
         save_state(st)
     if lines:
@@ -580,7 +580,7 @@ def cmd_apply(args, approved=None):
                 print("aborted")
                 return 1
     if forced:
-        msg = "%s: age gate bypassed with --force for %s (published %s ago, minimum %g days)" % (
+        msg = "`%s`: age gate bypassed with --force for `%s` (published %s ago, minimum %g days)" % (
             s.name, version, fmt_age(time.time() - cand["published"]), s.min_age / 86400)
         log(msg)
         send(msg, level="warn")
@@ -588,7 +588,7 @@ def cmd_apply(args, approved=None):
         with Lock("apply", block=False):
             return do_apply(s, version, tag, expect_digest)
     except BlockingIOError:
-        msg = "%s: another update is running, try again later" % s.name
+        msg = "`%s`: another update is running, try again later" % s.name
         log(msg)
         send(msg)
         return 1
@@ -636,12 +636,12 @@ def _do_apply(s, version, tag, expect_digest):
     # never move backwards: a stale button or CLI call for an older/equal version is refused
     if s.src["type"] == "github":
         if vtuple(version) <= vtuple(s.running()):
-            msg = "%s: refusing %s, running %s is the same or newer (no downgrades)" % (s.name, version, s.running())
+            msg = "`%s`: refusing `%s`, running `%s` is the same or newer (no downgrades)" % (s.name, version, s.running())
             log(msg, run_log)
             send("⛔ " + msg)
             return 1
     elif tag != old_tag:
-        msg = "%s: refusing tag change %s -> %s for a digest-tracked service" % (s.name, old_tag, tag)
+        msg = "`%s`: refusing tag change `%s` → `%s` for a digest-tracked service" % (s.name, old_tag, tag)
         log(msg, run_log)
         send("⛔ " + msg)
         return 1
@@ -650,7 +650,7 @@ def _do_apply(s, version, tag, expect_digest):
     eng = engine()
     bak = "%s.bak-svc-update-%s" % (s.compose_file, stamp)
     log("%s: update %s@%s -> %s (%s, log %s)" % (s.name, old_tag, (old_digest or "")[7:19], tag, eng, run_log), run_log)
-    send("⏳ %s: updating %s → %s" % (s.name, old_tag, tag))
+    send("⏳ `%s`: updating `%s` → `%s`" % (s.name, old_tag, tag))
     # 1) everything that can fail without touching the running service
     try:
         s.hook("pre", run_log)
@@ -664,7 +664,7 @@ def _do_apply(s, version, tag, expect_digest):
             raise RuntimeError("pulled image does not carry the offered digest %s (has %s)" % (expect_digest, found))
         if (tag, expect_digest) == (old_tag, old_digest):
             log("%s: already on %s@%s" % (s.name, tag, expect_digest[7:19]), run_log)
-            send("✅ %s already on %s" % (s.name, tag))
+            send("✅ `%s` already on `%s`" % (s.name, tag))
             return 0
         with open(s.compose_file) as f, open(bak, "w") as g:
             g.write(f.read())
@@ -674,7 +674,7 @@ def _do_apply(s, version, tag, expect_digest):
         if os.path.exists(bak):
             os.replace(bak, s.compose_file)
         log("%s: aborted before touching the service: %s" % (s.name, e), run_log)
-        send("❌ %s: update to %s aborted, nothing changed.\n%s" % (s.name, tag, str(e)[:600]))
+        send("❌ `%s`: update to `%s` aborted, nothing changed.\n```\n%s\n```" % (s.name, tag, str(e)[:600]))
         return 1
     # 2) switch
     try:
@@ -689,7 +689,7 @@ def _do_apply(s, version, tag, expect_digest):
             except Exception as e:
                 info += "; post hook failed: %s" % str(e)[:200]
         log("%s: updated to %s@%s: %s" % (s.name, tag, expect_digest[7:19], info), run_log)
-        send("✅ %s updated to %s (%s)\n%s\ncompose backup: %s"
+        send("✅ `%s` updated to `%s` (`%s`)\n%s\ncompose backup: `%s`"
              % (s.name, tag, expect_digest[7:19], info, os.path.basename(bak)))
         return 0
     # 3) roll back
@@ -703,7 +703,7 @@ def _do_apply(s, version, tag, expect_digest):
     except Exception as e:
         rb = "ROLLBACK ERROR: %s" % e
     log("%s: %s" % (s.name, rb), run_log)
-    send("❌ %s: update to %s failed: %s\n%s\nlog: %s" % (s.name, tag, info[:500], rb[:500], run_log), level="alert")
+    send("❌ `%s`: update to `%s` failed: %s\n%s\nlog: `%s`" % (s.name, tag, info[:500], rb[:500], run_log), level="alert")
     return 1
 
 
@@ -718,9 +718,9 @@ def report_killed_update():
         return  # still running
     except Exception:
         pass
-    msg = ("an update of %s to %s started %s did not finish (process killed). Check `svc-update status`, "
-           "the containers and the newest log in %s; compose backups are next to the compose file "
-           "(*.bak-svc-update-*)." % (ip.get("svc"), ip.get("to"), fmt_time(ip.get("started", 0)), RUNS))
+    msg = ("an update of `%s` to `%s` started %s did not finish (process killed). Check `svc-update status`, "
+           "the containers and the newest log in `%s`; compose backups are next to the compose file "
+           "(`*.bak-svc-update-*`)." % (ip.get("svc"), ip.get("to"), fmt_time(ip.get("started", 0)), RUNS))
     log("process: " + msg)
     send("⚠️ " + msg, level="warn")
     set_in_progress(None)
@@ -770,7 +770,7 @@ def process_one(req):
     if req["kind"] == "command":
         if req["command"] == "status":
             r = subprocess.run(me + ["status"], capture_output=True, text=True, timeout=300)
-            send("%s services:\n%s" % (HOSTNAME, (r.stdout or r.stderr)[-3500:]))
+            send("%s services:\n```\n%s\n```" % (HOSTNAME, (r.stdout or r.stderr)[-3500:].strip()))
         else:
             subprocess.run(me + ["check", "--reoffer", "--reply"], timeout=600)
         return
@@ -783,7 +783,7 @@ def process_one(req):
         return
     if req["verb"] == "s":
         log("process: skipped %s %s" % (p["svc"], p["version"]))
-        send("Skipped %s %s" % (p["svc"], p["version"]))
+        send("Skipped `%s` `%s`" % (p["svc"], p["version"]))
         return
     log("process: approved %s %s" % (p["svc"], p["version"]))
     cmd_apply(argparse.Namespace(service=p["svc"], yes=True, force=False, version=None), approved=p)
@@ -826,7 +826,7 @@ def cmd_self_update(args):
     newrev = out("rev-parse", "--short", "HEAD")
     subprocess.run([os.path.join(repo, "install.sh")], check=True)
     print("  ok   svc-update %s -> %s" % (old, newrev))
-    send("svc-update on %s updated %s -> %s" % (HOSTNAME, old, newrev))
+    send("svc-update on %s updated `%s` → `%s`" % (HOSTNAME, old, newrev))
     return 0
 
 
@@ -856,7 +856,7 @@ def main():
     elif args.cmd == "process-requests":
         cmd_process(args)
     elif args.cmd == "test-telegram":
-        print("queued" if send("svc-update test message from %s, ignore" % HOSTNAME) else "FAILED (is tg-gate installed?)")
+        print("queued" if send("svc-update test message from `%s`, ignore" % HOSTNAME) else "FAILED (is tg-gate installed?)")
     elif args.cmd == "self-update":
         sys.exit(cmd_self_update(args))
 
