@@ -221,6 +221,7 @@ systemctl daemon-reload
 check "update-check (unit) ok once due" systemctl start tg-gate-update-check.service
 wait_sent "notice names tg-gate" "sudo tg-gate self-update"
 wait_sent "notice names svc-update" "sudo svc-update self-update"
+wait_sent "notice shows the latest commit message" "latest: test: upstream ahead"
 check "clones unchanged by update-check" bash -c "! git -C /opt/tg-gate log -1 --format=%s | grep -q 'upstream ahead'"
 n=$(grep -c "Updates for the tools" $T/sendMessage.jsonl)
 systemctl start tg-gate-update-check.service; sleep 3
@@ -231,10 +232,13 @@ step "self-update (tg-gate and svc-update)"
 for r in tg-gate svc-update; do
   rm -rf /srv/work && git clone -q /srv/origin/$r.git /srv/work
   echo "test change" >> /srv/work/README.md && git -C /srv/work commit -qam "test: README" && git -C /srv/work push -q
+  out=$(echo n | $r self-update 2>&1); echo "$out" | tail -2
+  check "$r prompt names the latest commit" grep -qE 'Update to [0-9a-f]+ "test: README"\? \[y/N\]' <<<"$out"
   out=$($r self-update -y 2>&1); rc=$?; echo "$out" | tail -4
   check "$r self-update ok" test $rc = 0
   check "$r fast-forwarded" bash -c "git -C /opt/$r log -1 --format=%s | grep -q 'test: README'"
   wait_sent "$r update notice" "$( [ $r = tg-gate ] && echo '[tg-gate] updated' || echo 'svc-update on')"
+  wait_sent "$r update notice names the commit" "$(git -C /opt/$r rev-parse --short HEAD): test: README"
   out=$($r self-update -y 2>&1); check "$r then up to date" grep -q "up to date" <<<"$out"
 done
 check "gate still running after self-update" systemctl is-active --quiet tg-gate

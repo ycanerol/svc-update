@@ -808,7 +808,8 @@ def cmd_self_update(args):
         return 0
     print("%d new commit(s):\n%s" % (len(new.splitlines()), new))
     subprocess.run(git + ["--no-pager", "diff", "--stat", "HEAD", "@{u}"], check=True)
-    if not args.yes and input("Update? [y/N] ").strip().lower() != "y":
+    subject = out("log", "-1", "--format=%s", "@{u}")
+    if not args.yes and input("Update to %s \"%s\"? [y/N] " % (new.split()[0], subject)).strip().lower() != "y":
         print("aborted")
         return 1
     compile(out("show", "@{u}:svc-update"), "svc-update", "exec")
@@ -829,7 +830,7 @@ def cmd_self_update(args):
     newrev = out("rev-parse", "--short", "HEAD")
     subprocess.run([os.path.join(repo, "install.sh")], check=True)
     print("  ok   svc-update %s -> %s" % (old, newrev))
-    send("svc-update on %s updated `%s` → `%s`" % (HOSTNAME, old, newrev))
+    send("svc-update on %s updated `%s` → `%s`: %s" % (HOSTNAME, old, newrev, subject))
     return 0
 
 
