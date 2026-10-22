@@ -90,6 +90,15 @@ status = "running vs available versions"
 check = "check for updates now"
 EOF
   say ok "tg-gate plugin svc-update registered (user $RUN_AS)"
+  # tg-gate's hourly update-check tells you once when this clone is 12 h behind GitHub (tg-gate >= update-check)
+  if [ -d /etc/tg-gate/updates.d ]; then
+    cat > /etc/tg-gate/updates.d/svc-update.toml <<EOF
+# Written by svc-update's install.sh, read by tg-gate update-check.
+repo = "$PREFIX"
+command = "sudo svc-update self-update"
+EOF
+    say ok "update notices: registered with tg-gate update-check"
+  fi
   tg-gate sync
   [ "$RUN_AS" = root ] || id -nG "$RUN_AS" | grep -qw tg-notify ||
     { usermod -aG tg-notify "$RUN_AS"; say new "$RUN_AS added to group tg-notify"; }

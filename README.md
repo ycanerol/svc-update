@@ -26,7 +26,8 @@ up `svc-update-check.timer`, registers the tg-gate plugin (buttons, `/status`, `
 installed, and remembers its options in `/etc/svc-update/install.env`.
 
 Update later with `sudo svc-update self-update`: it shows the new commits, asks, checks that the new code
-compiles, waits until no update is running, fast-forwards and re-runs `install.sh`. Nothing updates itself.
+compiles, waits until no update is running, fast-forwards and re-runs `install.sh`. Nothing updates itself;
+with tg-gate installed, its hourly update check tells you once a new commit has been on GitHub for 12 h.
 
 **Rootless Podman:** run `loginctl enable-linger alice` and, as alice,
 `systemctl --user enable podman-restart.service`, or containers will not come back after a reboot.

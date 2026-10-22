@@ -204,6 +204,29 @@ not_sent_after "non-root message waits for the gate" "alice while gate is down" 
 systemctl start tg-gate
 wait_sent "queued message delivered after restart" "[t2@alice] alice while gate is down"
 
+step "update-check (notice once an upstream commit is 12 h old)"
+check "update-check timer enabled" systemctl is-enabled --quiet tg-gate-update-check.timer
+check "svc-update registered for update-check" grep -q 'repo = "/opt/svc-update"' /etc/tg-gate/updates.d/svc-update.toml
+check "update-check (unit, sandboxed) ok while up to date" systemctl start tg-gate-update-check.service
+for r in tg-gate svc-update; do
+  rm -rf /srv/work && git clone -q /srv/origin/$r.git /srv/work
+  git -C /srv/work commit -q --allow-empty -m "test: upstream ahead" && git -C /srv/work push -q
+done
+check "update-check (unit) ok while behind, inside the delay" systemctl start tg-gate-update-check.service
+check "first seen recorded for both" python3 -c "import json; s=json.load(open('/var/lib/tg-gate/update-check.json')); assert set(s) == {'tg-gate', 'svc-update'} and not any('notified' in e for e in s.values())"
+not_sent_after "no notice before 12 h" "Updates for the tools" 3
+mkdir -p /etc/systemd/system/tg-gate-update-check.service.d
+printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 -I /opt/tg-gate/tg-gate update-check --delay 0\n' > /etc/systemd/system/tg-gate-update-check.service.d/test.conf
+systemctl daemon-reload
+check "update-check (unit) ok once due" systemctl start tg-gate-update-check.service
+wait_sent "notice names tg-gate" "sudo tg-gate self-update"
+wait_sent "notice names svc-update" "sudo svc-update self-update"
+check "clones unchanged by update-check" bash -c "! git -C /opt/tg-gate log -1 --format=%s | grep -q 'upstream ahead'"
+n=$(grep -c "Updates for the tools" $T/sendMessage.jsonl)
+systemctl start tg-gate-update-check.service; sleep 3
+check "reported once" test "$(grep -c "Updates for the tools" $T/sendMessage.jsonl)" = "$n"
+rm -r /etc/systemd/system/tg-gate-update-check.service.d && systemctl daemon-reload
+
 step "self-update (tg-gate and svc-update)"
 for r in tg-gate svc-update; do
   rm -rf /srv/work && git clone -q /srv/origin/$r.git /srv/work
